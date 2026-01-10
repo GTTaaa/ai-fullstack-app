@@ -1,7 +1,6 @@
-import time, os, json
+import os, json
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from openai import AsyncOpenAI  # 引入异步通讯器
 from dotenv import load_dotenv  # 引入环境变量加载器
@@ -9,7 +8,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy import desc
 
 # --- 引入我们刚才写的数据库配置 ---
-from .database import engine, SessionLocal, Base, AnalysisRecord
+from .database import engine, SessionLocal, Base
+from . import models, schemas  # 引入 models 和 schemas
 
 # 1. 加载 .env 文件里的配置
 load_dotenv()
@@ -20,20 +20,19 @@ client = AsyncOpenAI(base_url=os.getenv("AI_BASE_URL"), api_key=os.getenv("AI_AP
 
 # --- 关键动作：自动创建数据库表 ---
 # 这一行代码运行后，会自动生成 sql_app.db 文件
-Base.metadata.create_all(bind=engine)
+# Base.metadata.create_all(bind=engine)
+models.Base.metadata.create_all(bind=engine)
 
 app = FastAPI()
 
 # --- 关键配置：解决跨域问题 (CORS) ---
 # 允许前端 (http://localhost:5173) 访问后端
-origins = [
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=[
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -51,14 +50,9 @@ def get_db():
         db.close()
 
 
-# --- 定义数据格式 ---
-class TextRequest(BaseModel):
-    text: str
-
-
 # --- 核心功能：文本分析接口 ---
 @app.post("/analyze")
-async def analyze_text(request: TextRequest, db: Session = Depends(get_db)):  # 注入 db
+async def analyze_text(request: schemas.TextRequest, db: Session = Depends(get_db)):  # 注入 db
     # 检查是否配置了 Key
     if not os.getenv("AI_API_KEY"):
         raise HTTPException(status_code=500, detail="后端未配置 API Key")
@@ -115,7 +109,7 @@ async def analyze_text(request: TextRequest, db: Session = Depends(get_db)):  # 
         print(f"正在保存数据: {request.text[:10]}...")
 
         # 创建一条新记录对象
-        db_record = AnalysisRecord(
+        db_record = models.AnalysisRecord(
             text_content=request.text,
             ai_reply=result["ai_reply"],
             sentiment=result["sentiment"],
@@ -146,24 +140,42 @@ async def analyze_text(request: TextRequest, db: Session = Depends(get_db)):  # 
 # 如果没有这个，你前端下面的列表就拿不到数据
 @app.get("/history")
 def get_history(db: Session = Depends(get_db)):
-    records = db.query(AnalysisRecord).order_by(desc(AnalysisRecord.id)).limit(10).all()
+    records = db.query(models.AnalysisRecord).order_by(desc(models.AnalysisRecord.id)).limit(10).all()
     return records
 
 
 # --- 新增：流式聊天接口 ---
 @app.post("/chat")
-async def chat_stream(request: TextRequest,db:Session = Depends(get_db)):
+async def chat_stream(request: schemas.TextRequest, db: Session = Depends(get_db)):
+
+    # === 步骤 1: 查库 ===
+    # 为什么要 limit(5)? 防止把 AI 撑死。
+    # 为什么要 reverse()? 因为 AI 阅读顺序是从上到下的。
+    recent_history = (
+        db.query(models.AnalysisRecord).order_by(desc(models.AnalysisRecord.id)).limit(5).all()
+    )
+    recent_history.reverse()
+
+    message_context = [{"role": "system", "content": "你是一个记性很好的 AI 助手"}]
+    for record in recent_history:
+        if record.text_content:
+            message_context.append({"role": "user", "content": record.text_content})
+            if record.ai_reply:
+                message_context.append(
+                    {"role": "assistant", "content": record.ai_reply}
+                )
+    # 加上当前用户的新对话
+    message_context.append({"role": "user", "content": request.text})
+
+    # 发送
     # 1. 定义一个生成器函数 (Generator)
     # 它的作用是：一边收 AI 的字，一边往外吐
     async def generate():
-        accumulated_reply = ''
+        accumulated_reply = ""
         try:
             stream = await client.chat.completions.create(
                 model="deepseek-v3.1",  # 或者你正在用的 deepseek-v3.1
-                messages=[
-                    {"role": "system", "content": "你是一个乐于助人的聊天助手。"},
-                    {"role": "user", "content": request.text},
-                ],
+                messages=message_context,
                 stream=True,  # <--- 关键开关！开启流式模式
             )
 
@@ -175,20 +187,20 @@ async def chat_stream(request: TextRequest,db:Session = Depends(get_db)):
                     accumulated_reply += content
                     # 可以在这里打印看看：print(content, end="")
                     yield content
-                    
+
                     # 2。SSE 规范：每条数据前加 data:，每条消息后空一行
                     # yield f"data: {content}\n\n"
-            
+
             # === 循环结束，说明 AI 说完了 ===
             # ✅ 3. 在这里一次性存入数据库
-            print(f"流式对话结束，存入数据库: {accumulated_reply[:10]}...")
-            
+            # print(f"流式对话结束，存入数据库: {accumulated_reply[:10]}...")
+
             # 因为是纯聊天，没有情感分析字段，我们填入默认值
-            db_record = AnalysisRecord(
+            db_record = models.AnalysisRecord(
                 text_content=request.text,
-                ai_reply=accumulated_reply, # 存的是完整的话
-                sentiment="对话模式",       # 标记一下这是聊天
-                word_count=len(accumulated_reply)
+                ai_reply=accumulated_reply,  # 存的是完整的话
+                sentiment="对话模式",  # 标记一下这是聊天
+                word_count=len(accumulated_reply),
             )
             db.add(db_record)
             db.commit()
